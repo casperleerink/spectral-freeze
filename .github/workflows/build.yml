@@ -1,0 +1,38 @@
+name: Build plugin
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch: # allows manual triggering from the Actions tab
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+            artifact_path: build/SpectralFreeze_artefacts/Release/VST3
+          - os: macos-latest
+            name: macOS
+            artifact_path: build/SpectralFreeze_artefacts/Release/VST3
+
+    runs-on: ${{ matrix.os }}
+    name: Build (${{ matrix.name }})
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Upload VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpectralFreeze-${{ matrix.name }}-VST3
+          path: ${{ matrix.artifact_path }}
