@@ -3,8 +3,13 @@ name: Build plugin
 on:
   push:
     branches: [main, master]
+    tags: ['v*'] # tag pushes (e.g. v0.1.0) trigger the release path below
   pull_request:
   workflow_dispatch: # allows manual triggering from the Actions tab
+
+# Needed by softprops/action-gh-release to publish the release. Scoped to this workflow only.
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -31,8 +36,36 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      - name: Upload VST3
+      - name: Upload VST3 as CI artifact
         uses: actions/upload-artifact@v4
         with:
           name: SpectralFreeze-${{ matrix.name }}-VST3
           path: ${{ matrix.artifact_path }}
+
+      # --- Release path: only runs for tag pushes ---------------------------------------
+      # Zips the VST3 bundle into a single file per platform so the friend downloads one
+      # archive, not a sprawl of folders. Each platform's job attaches its own zip to the
+      # same release (identified by the pushed tag).
+
+      - name: Package VST3 (Windows)
+        if: startsWith(github.ref, 'refs/tags/') && matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "${{ matrix.artifact_path }}/Spectral Freeze.vst3" `
+            -DestinationPath "SpectralFreeze-Windows-${{ github.ref_name }}.zip"
+
+      - name: Package VST3 (macOS)
+        if: startsWith(github.ref, 'refs/tags/') && matrix.os == 'macos-latest'
+        run: |
+          cd "${{ matrix.artifact_path }}"
+          zip -r "$GITHUB_WORKSPACE/SpectralFreeze-macOS-${{ github.ref_name }}.zip" \
+                 "Spectral Freeze.vst3"
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SpectralFreeze-*-${{ github.ref_name }}.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
