@@ -1,64 +1,104 @@
 #include "PluginEditor.h"
 
+namespace
+{
+    juce::String mimeTypeForExtension (const juce::String& ext)
+    {
+        static const std::unordered_map<std::string, juce::String> map {
+            { "html", "text/html" },
+            { "htm",  "text/html" },
+            { "js",   "text/javascript" },
+            { "mjs",  "text/javascript" },
+            { "css",  "text/css" },
+            { "json", "application/json" },
+            { "svg",  "image/svg+xml" },
+            { "png",  "image/png" },
+            { "jpg",  "image/jpeg" },
+            { "jpeg", "image/jpeg" },
+            { "gif",  "image/gif" },
+            { "webp", "image/webp" },
+            { "ico",  "image/x-icon" },
+            { "woff", "font/woff" },
+            { "woff2","font/woff2" },
+            { "ttf",  "font/ttf" },
+            { "otf",  "font/otf" },
+            { "wasm", "application/wasm" },
+            { "map",  "application/json" },
+        };
+        const auto it = map.find (ext.toLowerCase().toStdString());
+        return it != map.end() ? it->second : juce::String ("application/octet-stream");
+    }
+}
+
 SpectralFreezeEditor::SpectralFreezeEditor (SpectralFreezeProcessor& p)
     : AudioProcessorEditor (&p), processorRef (p)
 {
-    gainSlider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-    gainSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 80, 20);
-    addAndMakeVisible (gainSlider);
+    addAndMakeVisible (webView);
 
-    gainLabel.setText ("Gain", juce::dontSendNotification);
-    gainLabel.setJustificationType (juce::Justification::centred);
-    gainLabel.attachToComponent (&gainSlider, false);
-    addAndMakeVisible (gainLabel);
+   #if SPECTRAL_FREEZE_UI_DEV
+    webView.goToURL (SPECTRAL_FREEZE_UI_DEV_URL);
+   #else
+    webView.goToURL (juce::WebBrowserComponent::getResourceProviderRoot());
+   #endif
 
-    gainAttachment = std::make_unique<SliderAttachment> (
-        processorRef.apvts, SpectralFreezeProcessor::gainParamID, gainSlider);
-
-    filterSlider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-    filterSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 80, 20);
-    addAndMakeVisible (filterSlider);
-
-    filterLabel.setText ("Filter", juce::dontSendNotification);
-    filterLabel.setJustificationType (juce::Justification::centred);
-    filterLabel.attachToComponent (&filterSlider, false);
-    addAndMakeVisible (filterLabel);
-
-    filterAttachment = std::make_unique<SliderAttachment> (
-        processorRef.apvts, SpectralFreezeProcessor::filterParamID, filterSlider);
-
-    freezeButton.setClickingTogglesState (true);
-    addAndMakeVisible (freezeButton);
-    freezeAttachment = std::make_unique<ButtonAttachment> (
-        processorRef.apvts, SpectralFreezeProcessor::freezeParamID, freezeButton);
-
-    setSize (480, 320);
+    setResizable (true, true);
+    setResizeLimits (480, 320, 1600, 1000);
+    setSize (720, 420);
 }
 
 SpectralFreezeEditor::~SpectralFreezeEditor() = default;
 
-void SpectralFreezeEditor::paint (juce::Graphics& g)
-{
-    g.fillAll (juce::Colour::fromRGB (18, 18, 22));
-
-    g.setColour (juce::Colours::white);
-    g.setFont (juce::Font (juce::FontOptions (22.0f).withStyle ("Bold")));
-    g.drawFittedText ("Spectral Freeze",
-                      getLocalBounds().removeFromTop (60),
-                      juce::Justification::centred, 1);
-}
-
 void SpectralFreezeEditor::resized()
 {
-    auto area = getLocalBounds().reduced (20);
-    area.removeFromTop (60); // title
+    webView.setBounds (getLocalBounds());
+}
 
-    auto knobRow = area.removeFromTop (200);
-    knobRow.removeFromTop (20); // label space for the rotary labels
+juce::WebBrowserComponent::Options SpectralFreezeEditor::buildOptions()
+{
+    auto options = juce::WebBrowserComponent::Options {}
+        .withBackend (juce::WebBrowserComponent::Options::Backend::webview2)
+        .withWinWebView2Options (juce::WebBrowserComponent::Options::WinWebView2 {}
+            .withUserDataFolder (juce::File::getSpecialLocation (juce::File::tempDirectory)))
+        .withNativeIntegrationEnabled()
+        .withOptionsFrom (filterRelay)
+        .withOptionsFrom (freezeRelay)
+        .withOptionsFrom (scMixRelay)
+        .withOptionsFrom (scSelectRelay)
+        .withOptionsFrom (scSmoothRelay);
 
-    const int knobWidth = knobRow.getWidth() / 2;
-    gainSlider.setBounds   (knobRow.removeFromLeft (knobWidth).withSizeKeepingCentre (140, 140));
-    filterSlider.setBounds (knobRow.withSizeKeepingCentre (140, 140));
+   #if ! SPECTRAL_FREEZE_UI_DEV
+    options = options.withResourceProvider (
+        [this] (const juce::String& url) { return provideResource (url); },
+        juce::URL (juce::WebBrowserComponent::getResourceProviderRoot()).getOrigin());
+   #endif
 
-    freezeButton.setBounds (area.removeFromTop (40).withSizeKeepingCentre (140, 32));
+    return options;
+}
+
+std::optional<juce::WebBrowserComponent::Resource>
+SpectralFreezeEditor::provideResource (const juce::String& urlPath)
+{
+    // urlPath arrives like "/" or "/assets/main-abcd.js" — strip the leading slash
+    // and map "/" → "index.html" (standard static-site behaviour).
+    auto relative = urlPath.startsWith ("/") ? urlPath.substring (1) : urlPath;
+    if (relative.isEmpty())
+        relative = "index.html";
+
+    const juce::File distRoot { SPECTRAL_FREEZE_UI_DIST_DIR };
+    const juce::File file = distRoot.getChildFile (relative);
+
+    if (! file.existsAsFile())
+        return std::nullopt;
+
+    juce::MemoryBlock bytes;
+    if (! file.loadFileAsData (bytes))
+        return std::nullopt;
+
+    std::vector<std::byte> data (bytes.getSize());
+    std::memcpy (data.data(), bytes.getData(), bytes.getSize());
+
+    return juce::WebBrowserComponent::Resource {
+        std::move (data),
+        mimeTypeForExtension (file.getFileExtension().trimCharactersAtStart ("."))
+    };
 }

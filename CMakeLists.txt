@@ -42,16 +42,25 @@ target_sources(SpectralFreeze PRIVATE
     Source/PluginEditor.cpp
 )
 
+# Dev mode loads the UI from the Vite dev server (http://localhost:5173) so
+# front-end edits hot-reload inside the plugin window. Turn this OFF for a
+# build that serves the UI from ui/dist/ on disk via the resource provider.
+option(SPECTRAL_FREEZE_UI_DEV "Load UI from the Vite dev server" ON)
+
 target_compile_definitions(SpectralFreeze PUBLIC
-    JUCE_WEB_BROWSER=0
+    JUCE_WEB_BROWSER=1
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
+    SPECTRAL_FREEZE_UI_DEV=$<IF:$<BOOL:${SPECTRAL_FREEZE_UI_DEV}>,1,0>
+    SPECTRAL_FREEZE_UI_DEV_URL="http://localhost:5173/"
+    SPECTRAL_FREEZE_UI_DIST_DIR="${CMAKE_SOURCE_DIR}/ui/dist"
 )
 
 target_link_libraries(SpectralFreeze
     PRIVATE
         juce::juce_audio_utils
         juce::juce_dsp
+        juce::juce_gui_extra
     PUBLIC
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags

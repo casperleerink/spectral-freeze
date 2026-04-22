@@ -5,3 +5,5 @@ build/
 *.user
 .DS_Store
 compile_commands.json
+ui/node_modules/
+ui/dist/

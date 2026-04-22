@@ -37,9 +37,11 @@ public:
     // Exposed so the editor can attach its slider.
     juce::AudioProcessorValueTreeState apvts;
 
-    static constexpr const char* gainParamID   = "gain";
-    static constexpr const char* freezeParamID = "freeze";
-    static constexpr const char* filterParamID = "filter";
+    static constexpr const char* freezeParamID   = "freeze";
+    static constexpr const char* filterParamID   = "filter";
+    static constexpr const char* scMixParamID    = "scMix";
+    static constexpr const char* scSelectParamID = "scSelectivity";
+    static constexpr const char* scSmoothParamID = "scSmoothing";
 
     // STFT config — 2048 @ 75% overlap. fftSize/hopSize = 4 → four overlapping windows per output sample.
     static constexpr int fftOrder = 11;
@@ -50,10 +52,11 @@ public:
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
-    std::atomic<float>* gainParam   { nullptr };
-    std::atomic<float>* freezeParam { nullptr };
-    std::atomic<float>* filterParam { nullptr };
-    juce::LinearSmoothedValue<float> smoothedGain;
+    std::atomic<float>* freezeParam   { nullptr };
+    std::atomic<float>* filterParam   { nullptr };
+    std::atomic<float>* scMixParam    { nullptr };
+    std::atomic<float>* scSelectParam { nullptr };
+    std::atomic<float>* scSmoothParam { nullptr };
 
     // Per-bin natural phase advance across one hop: 2π·k·hopSize/fftSize.
     // Precomputed so freeze resynthesis stays cheap inside the audio thread.
@@ -70,18 +73,39 @@ private:
         std::array<float, numBins> frozenMag   {};
         std::array<float, numBins> frozenPhase {};
 
-        int  fifoPos    = 0;     // next write slot; also "oldest" slot from reader's POV
-        int  hopCounter = 0;     // samples since last hop fired
-        bool wasFrozen  = false; // previous frame's freeze state — detects rising edge
+        int  fifoPos   = 0;     // next write slot; also "oldest" slot from reader's POV
+        bool wasFrozen = false; // previous frame's freeze state — detects rising edge
     };
 
-    std::vector<ChannelState> channels;
+    // Sidechain needs FIFO + FFT scratch only — no output OLA and no freeze memory.
+    // Its output is a magnitude spectrum consumed by the mask, not an audio stream.
+    struct SidechainState
+    {
+        std::array<float, fftSize>     inputFifo {};
+        std::array<float, fftSize * 2> fftScratch {};
+        int fifoPos = 0;
+    };
+
+    std::vector<ChannelState>   channels;
+    std::vector<SidechainState> scChannels;
+
+    // Sidechain magnitude spectra — summed across SC channels so one mask drives
+    // every main channel. `scLatestMag` is the raw per-hop spectrum; `scSmoothedMag`
+    // is the time-smoothed version consumed by the mask (and, later, the UI).
+    std::array<float, numBins> scLatestMag   {};
+    std::array<float, numBins> scSmoothedMag {};
+
+    // Shared hop counter — main and sidechain FFTs must fire on the same sample.
+    int masterHopCounter = 0;
+
     juce::dsp::FFT fft { fftOrder };
     std::array<float, fftSize> window {}; // Hann — used as both analysis and synthesis window
     float windowGain = 1.0f;              // 1 / Σ window[k·hop]² → forces unity OLA
 
-    void processFrame (ChannelState& st);
+    void processFrame (ChannelState& st, bool applySidechain);
+    void processSidechainHop (SidechainState& sc) noexcept;
     void applySpectralFilter (float* spectrum, float filterAmt) noexcept;
+    void applySidechainMask (float* spectrum, float mix, float selectivity) noexcept;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SpectralFreezeProcessor)
 };

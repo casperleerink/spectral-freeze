@@ -1,0 +1,25 @@
+{
+  "name": "spectral-freeze-ui",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Solid + Vite + Tailwind UI for the Spectral Freeze JUCE plugin.",
+  "packageManager": "bun@1.3.10",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "juce-framework-frontend": "file:../build/_deps/juce-src/modules/juce_gui_extra/native/javascript",
+    "solid-js": "latest"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "latest",
+    "tailwindcss": "latest",
+    "typescript": "latest",
+    "vite": "latest",
+    "vite-plugin-solid": "latest"
+  }
+}

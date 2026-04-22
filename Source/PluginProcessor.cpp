@@ -3,14 +3,18 @@
 
 SpectralFreezeProcessor::SpectralFreezeProcessor()
     : AudioProcessor (BusesProperties()
-          .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
-          .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+          .withInput  ("Input",     juce::AudioChannelSet::stereo(), true)
+          .withOutput ("Output",    juce::AudioChannelSet::stereo(), true)
+          .withInput  ("Sidechain", juce::AudioChannelSet::stereo(), false)),
       apvts (*this, nullptr, "PARAMS", createParameterLayout())
 {
-    gainParam   = apvts.getRawParameterValue (gainParamID);
-    freezeParam = apvts.getRawParameterValue (freezeParamID);
-    filterParam = apvts.getRawParameterValue (filterParamID);
-    jassert (gainParam != nullptr && freezeParam != nullptr && filterParam != nullptr);
+    freezeParam   = apvts.getRawParameterValue (freezeParamID);
+    filterParam   = apvts.getRawParameterValue (filterParamID);
+    scMixParam    = apvts.getRawParameterValue (scMixParamID);
+    scSelectParam = apvts.getRawParameterValue (scSelectParamID);
+    scSmoothParam = apvts.getRawParameterValue (scSmoothParamID);
+    jassert (freezeParam != nullptr && filterParam != nullptr
+             && scMixParam != nullptr && scSelectParam != nullptr && scSmoothParam != nullptr);
 }
 
 SpectralFreezeProcessor::~SpectralFreezeProcessor() = default;
@@ -19,12 +23,6 @@ juce::AudioProcessorValueTreeState::ParameterLayout
 SpectralFreezeProcessor::createParameterLayout()
 {
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
-
-    layout.add (std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID { gainParamID, 1 },
-        "Gain",
-        juce::NormalisableRange<float> { -60.0f, 12.0f, 0.01f },
-        0.0f));
 
     layout.add (std::make_unique<juce::AudioParameterBool> (
         juce::ParameterID { freezeParamID, 1 },
@@ -38,15 +36,35 @@ SpectralFreezeProcessor::createParameterLayout()
         juce::NormalisableRange<float> { 0.0f, 1.0f, 0.001f },
         0.0f));
 
+    // Sidechain mask controls.
+    // Mix        — dry↔wet blend between "pass main untouched" and "gate main by SC spectrum".
+    // Selectivity — gamma on the normalised SC spectrum: 0 = gentle sympathetic ring,
+    //               1 = strict "only the loudest SC bins pass."
+    // Smoothing  — per-bin one-pole follower on the SC magnitude: tames the chirpy
+    //               frame-to-frame jitter you get from raw FFT magnitudes.
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID { scMixParamID, 1 },
+        "SC Mix",
+        juce::NormalisableRange<float> { 0.0f, 1.0f, 0.001f },
+        0.0f));
+
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID { scSelectParamID, 1 },
+        "SC Selectivity",
+        juce::NormalisableRange<float> { 0.0f, 1.0f, 0.001f },
+        0.5f));
+
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID { scSmoothParamID, 1 },
+        "SC Smoothing",
+        juce::NormalisableRange<float> { 0.0f, 1.0f, 0.001f },
+        0.3f));
+
     return layout;
 }
 
-void SpectralFreezeProcessor::prepareToPlay (double sampleRate, int /*samplesPerBlock*/)
+void SpectralFreezeProcessor::prepareToPlay (double /*sampleRate*/, int /*samplesPerBlock*/)
 {
-    smoothedGain.reset (sampleRate, 0.02); // 20 ms ramp
-    const float initialDb = gainParam != nullptr ? gainParam->load() : 0.0f;
-    smoothedGain.setCurrentAndTargetValue (juce::Decibels::decibelsToGain (initialDb));
-
     // Hann window — applied for BOTH analysis and synthesis (i.e. Hann²).
     for (int n = 0; n < fftSize; ++n)
         window[(size_t) n] = 0.5f - 0.5f * std::cos (juce::MathConstants<float>::twoPi
@@ -69,8 +87,14 @@ void SpectralFreezeProcessor::prepareToPlay (double sampleRate, int /*samplesPer
         phaseAdvance[(size_t) k] = std::remainder (raw, juce::MathConstants<float>::twoPi);
     }
 
-    // One STFT state per input channel. Fresh zeros on each prepareToPlay.
-    channels.assign ((size_t) getTotalNumInputChannels(), ChannelState{});
+    // Size STFT state by bus, not by total input count — the sidechain bus
+    // has its own leaner state and shouldn't inflate the main vector.
+    channels  .assign ((size_t) getChannelCountOfBus (true, 0), ChannelState{});
+    scChannels.assign ((size_t) getChannelCountOfBus (true, 1), SidechainState{});
+
+    scLatestMag.fill (0.0f);
+    scSmoothedMag.fill (0.0f);
+    masterHopCounter = 0;
 
     // Report streaming-STFT latency so hosts align bypass/compare. Impulse-response
     // proves: input at t=0 reaches output at t=fftSize.
@@ -81,10 +105,23 @@ void SpectralFreezeProcessor::releaseResources() {}
 
 bool SpectralFreezeProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
+    const auto& mainIn  = layouts.getMainInputChannelSet();
     const auto& mainOut = layouts.getMainOutputChannelSet();
     if (mainOut != juce::AudioChannelSet::mono() && mainOut != juce::AudioChannelSet::stereo())
         return false;
-    return mainOut == layouts.getMainInputChannelSet();
+    if (mainIn != mainOut)
+        return false;
+
+    // Sidechain is optional: hosts may leave it disabled, or attach mono/stereo.
+    if (layouts.inputBuses.size() > 1)
+    {
+        const auto& sc = layouts.inputBuses.getReference (1);
+        if (! sc.isDisabled()
+            && sc != juce::AudioChannelSet::mono()
+            && sc != juce::AudioChannelSet::stereo())
+            return false;
+    }
+    return true;
 }
 
 void SpectralFreezeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
@@ -94,31 +131,81 @@ void SpectralFreezeProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
     for (int ch = getTotalNumInputChannels(); ch < getTotalNumOutputChannels(); ++ch)
         buffer.clear (ch, 0, buffer.getNumSamples());
 
-    smoothedGain.setTargetValue (juce::Decibels::decibelsToGain (gainParam->load()));
+    // Alias the main I/O slice of `buffer`. getBusBuffer returns a view that
+    // writes back into the same memory, so writes here ARE the plugin output.
+    auto  mainBuf = getBusBuffer (buffer, true, 0);
+    const int numSamples   = mainBuf.getNumSamples();
+    const int mainChannels = juce::jmin (mainBuf.getNumChannels(), (int) channels.size());
 
-    const int numSamples  = buffer.getNumSamples();
-    const int numChannels = buffer.getNumChannels();
-
-    // Streaming STFT: push input into ring buffer, pop overlap-added output,
-    // fire an FFT round-trip every `hopSize` samples.
-    for (int ch = 0; ch < numChannels && ch < (int) channels.size(); ++ch)
+    // Sidechain bus may be absent (host didn't wire it) or disabled (host wired
+    // it but user hasn't attached audio). Both cases route through the same guard.
+    const auto* scBus      = getBus (true, 1);
+    const bool  scBusLive  = scBus != nullptr && scBus->isEnabled() && ! scChannels.empty();
+    juce::AudioBuffer<float> scBuf;
+    int scChNum = 0;
+    if (scBusLive)
     {
-        auto& st = channels[(size_t) ch];
-        auto* data = buffer.getWritePointer (ch);
+        scBuf   = getBusBuffer (buffer, true, 1);
+        scChNum = juce::jmin (scBuf.getNumChannels(), (int) scChannels.size());
+    }
 
-        for (int n = 0; n < numSamples; ++n)
+    const float scMix       = juce::jlimit (0.0f, 1.0f, scMixParam->load());
+    const float scSmoothAmt = juce::jlimit (0.0f, 1.0f, scSmoothParam->load());
+    const bool  runSidechain = scBusLive && scChNum > 0 && scMix > 0.0f;
+
+    // Map smoothing knob onto a one-pole retention coefficient in [0, 0.98].
+    // 0.98 ≈ ~200 ms time-constant at hopSize/44.1kHz — gentle "sympathetic ring."
+    const float scRetention = scSmoothAmt * 0.98f;
+
+    // Sample-level outer loop so MAIN + SIDECHAIN hit their hop boundary in
+    // perfect lockstep. Within a hop we pull the SC magnitude spectrum first,
+    // then feed it to every main channel's frame.
+    for (int n = 0; n < numSamples; ++n)
+    {
+        // Main: push input, pop output, advance fifoPos.
+        for (int ch = 0; ch < mainChannels; ++ch)
         {
+            auto& st   = channels[(size_t) ch];
+            auto* data = mainBuf.getWritePointer (ch);
             st.inputFifo[(size_t) st.fifoPos]  = data[n];
             data[n]                            = st.outputFifo[(size_t) st.fifoPos];
-            st.outputFifo[(size_t) st.fifoPos] = 0.0f; // consume — frees slot for next OLA
+            st.outputFifo[(size_t) st.fifoPos] = 0.0f;
             st.fifoPos = (st.fifoPos + 1) % fftSize;
+        }
 
-            if (++st.hopCounter >= hopSize)
+        // Sidechain: push only — no output to reconstruct.
+        if (runSidechain)
+        {
+            for (int ch = 0; ch < scChNum; ++ch)
             {
-                st.hopCounter = 0;
-                processFrame (st);
-                // Overlap-add the just-synthesised frame into outputFifo starting at
-                // the current fifoPos (which is the "oldest" slot from the read side).
+                auto& sc = scChannels[(size_t) ch];
+                sc.inputFifo[(size_t) sc.fifoPos] = scBuf.getReadPointer (ch)[n];
+                sc.fifoPos = (sc.fifoPos + 1) % fftSize;
+            }
+        }
+
+        if (++masterHopCounter >= hopSize)
+        {
+            masterHopCounter = 0;
+
+            if (runSidechain)
+            {
+                scLatestMag.fill (0.0f);
+                for (int ch = 0; ch < scChNum; ++ch)
+                    processSidechainHop (scChannels[(size_t) ch]);
+
+                // Time-smooth per-bin magnitude. Keeps held notes "ringing" in the
+                // mask after they've stopped, matching the sympathetic-resonance feel.
+                for (int k = 0; k < numBins; ++k)
+                    scSmoothedMag[(size_t) k]
+                        = scRetention * scSmoothedMag[(size_t) k]
+                        + (1.0f - scRetention) * scLatestMag[(size_t) k];
+            }
+
+            for (int ch = 0; ch < mainChannels; ++ch)
+            {
+                auto& st = channels[(size_t) ch];
+                processFrame (st, runSidechain);
                 for (int i = 0; i < fftSize; ++i)
                     st.outputFifo[(size_t) ((st.fifoPos + i) % fftSize)]
                         += st.fftScratch[(size_t) i];
@@ -126,16 +213,9 @@ void SpectralFreezeProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
         }
     }
 
-    // Apply post-STFT gain. Smoother ramps per-sample to prevent zipper noise.
-    for (int n = 0; n < numSamples; ++n)
-    {
-        const float g = smoothedGain.getNextValue();
-        for (int ch = 0; ch < numChannels; ++ch)
-            buffer.getWritePointer (ch)[n] *= g;
-    }
 }
 
-void SpectralFreezeProcessor::processFrame (ChannelState& st)
+void SpectralFreezeProcessor::processFrame (ChannelState& st, bool applySidechain)
 {
     const bool  freezeOn  = freezeParam->load() >= 0.5f;
     const float filterAmt = juce::jlimit (0.0f, 1.0f, filterParam->load());
@@ -200,6 +280,15 @@ void SpectralFreezeProcessor::processFrame (ChannelState& st)
     // and the frame's peak magnitude — see applySpectralFilter below.
     applySpectralFilter (st.fftScratch.data(), filterAmt);
 
+    // --- Sidechain mask ------------------------------------------------------------------
+    // Runs AFTER freeze resynthesis so a frozen cloud can be sculpted by a live sidechain.
+    if (applySidechain)
+    {
+        const float scMix = juce::jlimit (0.0f, 1.0f, scMixParam->load());
+        const float scSel = juce::jlimit (0.0f, 1.0f, scSelectParam->load());
+        applySidechainMask (st.fftScratch.data(), scMix, scSel);
+    }
+
     // --- Rebuild conjugate mirror so the inverse FFT returns a purely real signal --------
     // Bins fftSize/2+1 .. fftSize-1 must be conj of bins fftSize/2-1 .. 1.
     for (int k = 1; k < fftSize / 2; ++k)
@@ -254,6 +343,70 @@ void SpectralFreezeProcessor::applySpectralFilter (float* spectrum, float filter
             spectrum[2 * k]     = 0.0f;
             spectrum[2 * k + 1] = 0.0f;
         }
+    }
+}
+
+void SpectralFreezeProcessor::processSidechainHop (SidechainState& sc) noexcept
+{
+    // Unroll ring buffer into fftScratch in temporal order (same convention as main path).
+    for (int i = 0; i < fftSize; ++i)
+        sc.fftScratch[(size_t) i] = sc.inputFifo[(size_t) ((sc.fifoPos + i) % fftSize)];
+
+    // Window + forward FFT. Using the same Hann window as the main path keeps the
+    // two spectra on the same footing — their magnitudes are directly comparable.
+    for (int i = 0; i < fftSize; ++i)
+        sc.fftScratch[(size_t) i] *= window[(size_t) i];
+
+    fft.performRealOnlyForwardTransform (sc.fftScratch.data());
+
+    // Sum magnitudes across SC channels into scLatestMag. Caller zeroed it for
+    // this hop; each SC channel adds its own contribution.
+    for (int k = 0; k < numBins; ++k)
+    {
+        const float re = sc.fftScratch[(size_t) (2 * k)];
+        const float im = sc.fftScratch[(size_t) (2 * k + 1)];
+        scLatestMag[(size_t) k] += std::sqrt (re * re + im * im);
+    }
+}
+
+void SpectralFreezeProcessor::applySidechainMask (float* spectrum, float mix, float selectivity) noexcept
+{
+    if (mix <= 0.0f)
+        return;
+
+    // Peak of the smoothed SC spectrum — used to normalise into [0, 1]. Normalising
+    // means "SC loudness" doesn't swing the mask wildly; only the SHAPE matters.
+    float peak = 0.0f;
+    for (int k = 0; k < numBins; ++k)
+        if (scSmoothedMag[(size_t) k] > peak)
+            peak = scSmoothedMag[(size_t) k];
+
+    if (peak <= 1.0e-9f)
+    {
+        // SC is effectively silent: at mix=1 the main signal should duck to zero;
+        // at mix<1 it passes through proportionally. Matches how "held-notes-only"
+        // feels — when nothing is held, nothing rings.
+        const float g = 1.0f - mix;
+        for (int k = 0; k < numBins; ++k)
+        {
+            spectrum[2 * k]     *= g;
+            spectrum[2 * k + 1] *= g;
+        }
+        return;
+    }
+
+    // Map selectivity [0, 1] → gamma [0.5, 8]. Low gamma = broad "halo" around every
+    // SC partial; high gamma = strict "only the tallest peaks survive."
+    const float gamma   = 0.5f + selectivity * 7.5f;
+    const float invPeak = 1.0f / peak;
+
+    for (int k = 0; k < numBins; ++k)
+    {
+        const float norm = scSmoothedMag[(size_t) k] * invPeak;  // [0, 1]
+        const float mask = std::pow (norm, gamma);                // shaped selectivity
+        const float g    = (1.0f - mix) + mix * mask;             // mix blends mask↔unity
+        spectrum[2 * k]     *= g;
+        spectrum[2 * k + 1] *= g;
     }
 }
 
