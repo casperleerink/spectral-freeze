@@ -80,17 +80,15 @@ void SpectralFreezeProcessor::prepareToPlay (double /*sampleRate*/, int /*sample
     }
     windowGain = 1.0f / colaSum;
 
-    // Per-bin phase advance across one hop, wrapped to (-π, π] to stay numerically tight.
-    for (int k = 0; k < numBins; ++k)
-    {
-        const float raw = juce::MathConstants<float>::twoPi * (float) k * (float) hopSize / (float) fftSize;
-        phaseAdvance[(size_t) k] = std::remainder (raw, juce::MathConstants<float>::twoPi);
-    }
-
     // Size STFT state by bus, not by total input count — the sidechain bus
     // has its own leaner state and shouldn't inflate the main vector.
     channels  .assign ((size_t) getChannelCountOfBus (true, 0), ChannelState{});
     scChannels.assign ((size_t) getChannelCountOfBus (true, 1), SidechainState{});
+
+    // Seed each channel's phase RNG independently so L/R freeze noise is
+    // decorrelated — otherwise the stereo image collapses to a centre point.
+    for (auto& ch : channels)
+        ch.phaseRng.setSeedRandomly();
 
     scLatestMag.fill (0.0f);
     scSmoothedMag.fill (0.0f);
@@ -237,39 +235,50 @@ void SpectralFreezeProcessor::processFrame (ChannelState& st, bool applySidechai
             st.fftScratch[(size_t) i] *= window[(size_t) i];
 
         fft.performRealOnlyForwardTransform (st.fftScratch.data());
+
+        // Push this frame's magnitude spectrum into the rolling history so that
+        // capturing the freeze edge can average across several recent frames.
+        auto& slot = st.magHistory[(size_t) st.magHistoryWrite];
+        for (int k = 0; k < numBins; ++k)
+        {
+            const float re = st.fftScratch[(size_t) (2 * k)];
+            const float im = st.fftScratch[(size_t) (2 * k + 1)];
+            slot[(size_t) k] = std::sqrt (re * re + im * im);
+        }
+        st.magHistoryWrite = (st.magHistoryWrite + 1) % magHistorySize;
+        if (st.magHistoryCount < magHistorySize)
+            ++st.magHistoryCount;
     }
 
     // --- Freeze memory --------------------------------------------------------------------
     if (captureEdge)
     {
-        // Snapshot magnitude and phase for every non-negative bin; these drive resynthesis
-        // for as long as freeze stays engaged.
+        // Average magnitudes across whatever history we have. This smears out
+        // transients and vibrato in the snapshot so you hear a "steady timbre"
+        // instead of one frozen 46 ms window.
+        const int   count    = juce::jmax (1, st.magHistoryCount);
+        const float invCount = 1.0f / (float) count;
         for (int k = 0; k < numBins; ++k)
         {
-            const float re = st.fftScratch[(size_t) (2 * k)];
-            const float im = st.fftScratch[(size_t) (2 * k + 1)];
-            st.frozenMag  [(size_t) k] = std::sqrt (re * re + im * im);
-            st.frozenPhase[(size_t) k] = std::atan2 (im, re);
+            float sum = 0.0f;
+            for (int h = 0; h < count; ++h)
+                sum += st.magHistory[(size_t) h][(size_t) k];
+            st.frozenMag[(size_t) k] = sum * invCount;
         }
     }
 
     // --- Spectral processing --------------------------------------------------------------
     if (freezeOn)
     {
-        // Rebuild the spectrum from stored magnitudes, advancing each bin's phase by its
-        // natural hop increment. This keeps partials rotating like they would in the
-        // original signal, so sustained tones stay musical instead of buzzing.
+        // Draw a fresh phase per bin per hop. With 75%-overlap OLA the four
+        // overlapping synthesis frames sum incoherently, which turns a frozen
+        // tone into a smooth stochastic sustain — no hop-rate beating, no
+        // "single window repeating" signature.
         for (int k = 0; k < numBins; ++k)
         {
-            st.frozenPhase[(size_t) k] += phaseAdvance[(size_t) k];
-            // Wrap to stay in a comfortable range for std::cos/std::sin accuracy.
-            if (st.frozenPhase[(size_t) k] > juce::MathConstants<float>::pi)
-                st.frozenPhase[(size_t) k] -= juce::MathConstants<float>::twoPi;
-            else if (st.frozenPhase[(size_t) k] < -juce::MathConstants<float>::pi)
-                st.frozenPhase[(size_t) k] += juce::MathConstants<float>::twoPi;
-
-            const float mag   = st.frozenMag  [(size_t) k];
-            const float phase = st.frozenPhase[(size_t) k];
+            const float phase = st.phaseRng.nextFloat() * juce::MathConstants<float>::twoPi
+                              - juce::MathConstants<float>::pi;
+            const float mag = st.frozenMag[(size_t) k];
             st.fftScratch[(size_t) (2 * k)]     = mag * std::cos (phase);
             st.fftScratch[(size_t) (2 * k + 1)] = mag * std::sin (phase);
         }

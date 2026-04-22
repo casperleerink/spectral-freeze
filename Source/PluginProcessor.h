@@ -49,6 +49,10 @@ public:
     static constexpr int hopSize  = fftSize / 4;
     static constexpr int numBins  = fftSize / 2 + 1; // DC..Nyquist (non-negative frequencies)
 
+    // Freeze captures an averaged magnitude spectrum over the last N analysis hops
+    // (≈ 93 ms @ 44.1k), which smears out transients and vibrato in the snapshot.
+    static constexpr int magHistorySize = 8;
+
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
@@ -58,20 +62,24 @@ private:
     std::atomic<float>* scSelectParam { nullptr };
     std::atomic<float>* scSmoothParam { nullptr };
 
-    // Per-bin natural phase advance across one hop: 2π·k·hopSize/fftSize.
-    // Precomputed so freeze resynthesis stays cheap inside the audio thread.
-    std::array<float, numBins> phaseAdvance {};
-
     struct ChannelState
     {
         std::array<float, fftSize>     inputFifo {};
         std::array<float, fftSize>     outputFifo {};
         std::array<float, fftSize * 2> fftScratch {}; // juce real-FFT needs 2N floats
 
-        // Freeze memory: magnitude snapshot taken at the freeze edge, plus a running
-        // phase accumulator advanced each hop so sinusoids keep rotating naturally.
-        std::array<float, numBins> frozenMag   {};
-        std::array<float, numBins> frozenPhase {};
+        // Frozen magnitude spectrum — averaged over the last magHistorySize hops
+        // at the freeze edge. Phase is redrawn at random every hop during freeze
+        // (no accumulator needed), which kills hop-rate beating.
+        std::array<float, numBins> frozenMag {};
+
+        // Rolling history of recent analysis-frame magnitudes. Written on every
+        // non-frozen hop; averaged on the freeze edge to form `frozenMag`.
+        std::array<std::array<float, numBins>, magHistorySize> magHistory {};
+        int magHistoryWrite = 0;
+        int magHistoryCount = 0; // clamped to magHistorySize once full
+
+        juce::Random phaseRng; // per-channel so stereo noise is decorrelated
 
         int  fifoPos   = 0;     // next write slot; also "oldest" slot from reader's POV
         bool wasFrozen = false; // previous frame's freeze state — detects rising edge
