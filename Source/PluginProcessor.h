@@ -96,8 +96,10 @@ private:
 
         juce::Random phaseRng; // per-channel so stereo noise is decorrelated
 
-        int  fifoPos   = 0;     // next write slot; also "oldest" slot from reader's POV
-        bool wasFrozen = false; // previous frame's freeze state — detects rising edge
+        int  fifoPos     = 0; // next write slot; also "oldest" slot from reader's POV
+        int  samplesSeen = 0; // avoids freezing cold FIFO contents after host bus resets
+        bool wasFrozen   = false; // previous frame's freeze state — detects rising edge
+        bool hasFrozenFrame = false;
     };
 
     // Sidechain needs FIFO + FFT scratch only — no output OLA and no freeze memory.
@@ -117,6 +119,7 @@ private:
     // is the time-smoothed version consumed by the mask (and, later, the UI).
     std::array<float, numBins> scLatestMag   {};
     std::array<float, numBins> scSmoothedMag {};
+    float scRetentionPerHop = 0.65f;
 
     // Shared hop counter — main and sidechain FFTs must fire on the same sample.
     int masterHopCounter = 0;

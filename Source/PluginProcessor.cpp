@@ -53,7 +53,7 @@ SpectralFreezeProcessor::createParameterLayout()
     return layout;
 }
 
-void SpectralFreezeProcessor::prepareToPlay (double /*sampleRate*/, int /*samplesPerBlock*/)
+void SpectralFreezeProcessor::prepareToPlay (double sampleRate, int /*samplesPerBlock*/)
 {
     // Hann window — applied for BOTH analysis and synthesis (i.e. Hann²).
     for (int n = 0; n < fftSize; ++n)
@@ -86,6 +86,14 @@ void SpectralFreezeProcessor::prepareToPlay (double /*sampleRate*/, int /*sample
 
     scLatestMag.fill (0.0f);
     scSmoothedMag.fill (0.0f);
+
+    // Let the sidechain resonance release musically instead of dropping after a
+    // few STFT hops. This is an exponential decay measured in real time, so it
+    // remains similar at different host sample rates.
+    constexpr float sidechainReleaseSeconds = 0.75f;
+    const double safeSampleRate = sampleRate > 0.0 ? sampleRate : 44100.0;
+    scRetentionPerHop = std::exp (-static_cast<float> (hopSize / (safeSampleRate * sidechainReleaseSeconds)));
+
     masterHopCounter = 0;
 
     // Report streaming-STFT latency so hosts align bypass/compare. Impulse-response
@@ -144,10 +152,6 @@ void SpectralFreezeProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
     const float scBoostDb = juce::jlimit (0.0f, 18.0f, scBoostParam->load());
     const bool  runSidechain = scBusLive && scChNum > 0 && scBoostDb > 0.0f;
 
-    // Fixed, gentle time smoothing for the sidechain spectrum. The user-facing
-    // smoothing control is reserved for frequency width/blur, not envelope timing.
-    const float scRetention = 0.65f;
-
     // Sample-level outer loop so MAIN + SIDECHAIN hit their hop boundary in
     // perfect lockstep. Within a hop we pull the SC magnitude spectrum first,
     // then feed it to every main channel's frame.
@@ -162,6 +166,8 @@ void SpectralFreezeProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
             data[n]                            = st.outputFifo[(size_t) st.fifoPos];
             st.outputFifo[(size_t) st.fifoPos] = 0.0f;
             st.fifoPos = (st.fifoPos + 1) % fftSize;
+            if (st.samplesSeen < fftSize)
+                ++st.samplesSeen;
         }
 
         // Sidechain: push only — no output to reconstruct.
@@ -189,8 +195,8 @@ void SpectralFreezeProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
                 // mask after they've stopped, matching the sympathetic-resonance feel.
                 for (int k = 0; k < numBins; ++k)
                     scSmoothedMag[(size_t) k]
-                        = scRetention * scSmoothedMag[(size_t) k]
-                        + (1.0f - scRetention) * scLatestMag[(size_t) k];
+                        = scRetentionPerHop * scSmoothedMag[(size_t) k]
+                        + (1.0f - scRetentionPerHop) * scLatestMag[(size_t) k];
             }
 
             for (int ch = 0; ch < mainChannels; ++ch)
@@ -219,8 +225,9 @@ void SpectralFreezeProcessor::processFrame (ChannelState& st, bool applySidechai
     // --- Analysis: window + forward FFT ---------------------------------------------------
     // We still analyse even when frozen on the first frame of the edge, so we can
     // capture a fresh magnitude/phase snapshot. After that we skip analysis entirely.
-    const bool captureEdge = freezeOn && ! st.wasFrozen;
-    const bool runAnalysis = ! freezeOn || captureEdge;
+    const bool fifoPrimed = st.samplesSeen >= fftSize;
+    const bool captureEdge = freezeOn && fifoPrimed && (! st.wasFrozen || ! st.hasFrozenFrame);
+    const bool runAnalysis = ! freezeOn || captureEdge || ! st.hasFrozenFrame;
 
     if (runAnalysis)
     {
@@ -287,10 +294,16 @@ void SpectralFreezeProcessor::processFrame (ChannelState& st, bool applySidechai
             st.frozenPhase       [(size_t) k] = std::atan2 (im, re);
             st.frozenPhaseAdvance[(size_t) k] = st.smoothedPhaseAdvance[(size_t) k];
         }
+        st.hasFrozenFrame = true;
     }
 
+    // If the host reconfigures/enables the sidechain while Freeze is already on,
+    // prepareToPlay() can reset our STFT state. In that case there is no valid
+    // frozen spectrum yet; leave the analysed edge frame intact instead of
+    // resynthesising an all-zero/garbage freeze frame, which caused the chopped
+    // "no tone" failure when attaching a sidechain to an active freeze.
     // --- Spectral processing --------------------------------------------------------------
-    if (freezeOn)
+    if (freezeOn && st.hasFrozenFrame)
     {
         // Advance captured phase by the live signal's measured per-bin motion, with
         // only a tiny random walk. This avoids both extremes: no fresh random phase
