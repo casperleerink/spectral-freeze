@@ -40,6 +40,11 @@ juce_add_plugin(SpectralFreeze
 target_sources(SpectralFreeze PRIVATE
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp
+    Source/dsp/FreezeProcessor.cpp
+    Source/dsp/OrganicProcessor.cpp
+    Source/dsp/SidechainProcessor.cpp
+    Source/dsp/SpectralFilter.cpp
+    Source/dsp/StftProcessor.cpp
 )
 
 # Dev mode loads the UI from the Vite dev server (http://localhost:5173) so

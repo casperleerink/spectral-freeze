@@ -24,6 +24,11 @@ const App: Component = () => {
               format={(v) => `${Math.round(v * 100)}%`}
             />
             <Knob
+              paramId="organic"
+              label="Organic"
+              format={(v) => `${Math.round(v * 100)}%`}
+            />
+            <Knob
               paramId="scBoost"
               label="SC Boost"
               format={(v) => `+${v.toFixed(1)} dB`}
