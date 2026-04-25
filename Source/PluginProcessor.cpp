@@ -12,8 +12,10 @@ SpectralFreezeProcessor::SpectralFreezeProcessor()
     filterParam   = apvts.getRawParameterValue (filterParamID);
     scBoostParam      = apvts.getRawParameterValue (scBoostParamID);
     scFreqSmoothParam = apvts.getRawParameterValue (scFreqSmoothParamID);
+    organicParam      = apvts.getRawParameterValue (organicParamID);
     jassert (freezeParam != nullptr && filterParam != nullptr
-             && scBoostParam != nullptr && scFreqSmoothParam != nullptr);
+             && scBoostParam != nullptr && scFreqSmoothParam != nullptr
+             && organicParam != nullptr);
 }
 
 SpectralFreezeProcessor::~SpectralFreezeProcessor() = default;
@@ -50,6 +52,12 @@ SpectralFreezeProcessor::createParameterLayout()
         juce::NormalisableRange<float> { 0.0f, 1.0f, 0.001f },
         0.25f));
 
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID { organicParamID, 1 },
+        "Organic",
+        juce::NormalisableRange<float> { 0.0f, 1.0f, 0.001f },
+        0.0f));
+
     return layout;
 }
 
@@ -78,7 +86,15 @@ void SpectralFreezeProcessor::prepareToPlay (double sampleRate, int /*samplesPer
     // Seed each channel's tiny freeze phase wander independently so L/R do not
     // collapse into exactly the same frozen texture.
     for (auto& ch : channels)
+    {
         ch.phaseRng.setSeedRandomly();
+        for (int b = 0; b < organicAmBands; ++b)
+        {
+            ch.organicAmValue[(size_t) b]  = 0.0f;
+            ch.organicAmTarget[(size_t) b] = ch.phaseRng.nextFloat() * 2.0f - 1.0f;
+        }
+        ch.organicAmHopCounter = 0;
+    }
 
     for (int k = 0; k < numBins; ++k)
         phaseAdvance[(size_t) k] = juce::MathConstants<float>::twoPi
@@ -214,8 +230,9 @@ void SpectralFreezeProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
 
 void SpectralFreezeProcessor::processFrame (ChannelState& st, bool applySidechain)
 {
-    const bool  freezeOn  = freezeParam->load() >= 0.5f;
-    const float filterAmt = juce::jlimit (0.0f, 1.0f, filterParam->load());
+    const bool  freezeOn   = freezeParam->load() >= 0.5f;
+    const float filterAmt  = juce::jlimit (0.0f, 1.0f, filterParam->load());
+    const float organicAmt = juce::jlimit (0.0f, 1.0f, organicParam->load());
 
     // Unroll the ring buffer into fftScratch[0..fftSize-1] in TEMPORAL order:
     // fftScratch[0] = oldest sample in the window, fftScratch[fftSize-1] = newest.
@@ -308,11 +325,25 @@ void SpectralFreezeProcessor::processFrame (ChannelState& st, bool applySidechai
         // Advance captured phase by the live signal's measured per-bin motion, with
         // only a tiny random walk. This avoids both extremes: no fresh random phase
         // cloud, and no rigid bin-centre loop that chops/beats at the hop rate.
+        if (organicAmt > 0.0f)
+        {
+            if (++st.organicAmHopCounter >= 8)
+            {
+                st.organicAmHopCounter = 0;
+                for (int b = 0; b < organicAmBands; ++b)
+                    st.organicAmTarget[(size_t) b] = st.phaseRng.nextFloat() * 2.0f - 1.0f;
+            }
+
+            for (int b = 0; b < organicAmBands; ++b)
+                st.organicAmValue[(size_t) b] += 0.08f * (st.organicAmTarget[(size_t) b]
+                                                        - st.organicAmValue[(size_t) b]);
+        }
+
         for (int k = 0; k < numBins; ++k)
         {
             float phase = st.frozenPhase[(size_t) k]
-                        + st.frozenPhaseAdvance[(size_t) k]
-                        + (st.phaseRng.nextFloat() * 2.0f - 1.0f) * freezePhaseJitterRadians;
+                        + st.frozenPhaseAdvance[(size_t) k] * (1.0f + (st.phaseRng.nextFloat() * 2.0f - 1.0f) * organicAmt * 0.035f)
+                        + (st.phaseRng.nextFloat() * 2.0f - 1.0f) * (freezePhaseJitterRadians + organicAmt * 0.18f);
 
             if (phase > juce::MathConstants<float>::pi)
                 phase -= juce::MathConstants<float>::twoPi;
@@ -320,7 +351,16 @@ void SpectralFreezeProcessor::processFrame (ChannelState& st, bool applySidechai
                 phase += juce::MathConstants<float>::twoPi;
 
             st.frozenPhase[(size_t) k] = phase;
-            const float mag = st.frozenMag[(size_t) k];
+            const float bandPos = (float) k * (float) organicAmBands / (float) numBins;
+            const int band0 = juce::jlimit (0, organicAmBands - 1, (int) bandPos);
+            const int band1 = juce::jmin (organicAmBands - 1, band0 + 1);
+            const float frac = bandPos - (float) band0;
+            const float bandAm = st.organicAmValue[(size_t) band0] * (1.0f - frac)
+                               + st.organicAmValue[(size_t) band1] * frac;
+
+            const float mag = st.frozenMag[(size_t) k]
+                            * (1.0f + bandAm * organicAmt * 0.28f)
+                            * (1.0f + (st.phaseRng.nextFloat() * 2.0f - 1.0f) * organicAmt * 0.06f);
             st.fftScratch[(size_t) (2 * k)]     = mag * std::cos (phase);
             st.fftScratch[(size_t) (2 * k + 1)] = mag * std::sin (phase);
         }
@@ -330,6 +370,12 @@ void SpectralFreezeProcessor::processFrame (ChannelState& st, bool applySidechai
     // Gate bins below a per-frame threshold. The threshold is derived from `filterAmt`
     // and the frame's peak magnitude — see applySpectralFilter below.
     applySpectralFilter (st.fftScratch.data(), filterAmt);
+
+    // --- Organic macro -------------------------------------------------------------------
+    // Adds a little life back after strong spectral filtering: bin drift is handled
+    // in the freeze phase path above; here we add spectral softening plus a shaped,
+    // decorrelated residual floor so filtered frames don't collapse into pure sines.
+    applyOrganicSpectralProcessing (st, st.fftScratch.data(), organicAmt, filterAmt);
 
     // --- Sidechain mask ------------------------------------------------------------------
     // Runs AFTER freeze resynthesis so a frozen cloud can be sculpted by a live sidechain.
@@ -354,6 +400,8 @@ void SpectralFreezeProcessor::processFrame (ChannelState& st, bool applySidechai
 
     // --- Synthesis: inverse FFT + window + COLA gain -------------------------------------
     fft.performRealOnlyInverseTransform (st.fftScratch.data());
+
+    applyOrganicSaturation (st.fftScratch.data(), organicAmt);
 
     for (int i = 0; i < fftSize; ++i)
         st.fftScratch[(size_t) i] *= window[(size_t) i] * windowGain;
@@ -394,6 +442,83 @@ void SpectralFreezeProcessor::applySpectralFilter (float* spectrum, float filter
             spectrum[2 * k]     = 0.0f;
             spectrum[2 * k + 1] = 0.0f;
         }
+    }
+}
+
+void SpectralFreezeProcessor::applyOrganicSpectralProcessing (ChannelState& st, float* spectrum,
+                                                              float organicAmt, float filterAmt) noexcept
+{
+    if (organicAmt <= 0.0f)
+        return;
+
+    auto binMag = [] (const float* s, int k) noexcept
+    {
+        const float re = s[2 * k];
+        const float im = s[2 * k + 1];
+        return std::sqrt (re * re + im * im);
+    };
+
+    const float smoothAmt = organicAmt * (0.30f + 0.60f * filterAmt);
+    std::array<float, numBins> mag {};
+    std::array<float, numBins> phase {};
+    std::array<float, numBins> shapedMag {};
+
+    float peak = 0.0f;
+    for (int k = 0; k < numBins; ++k)
+    {
+        mag[(size_t) k] = binMag (spectrum, k);
+        phase[(size_t) k] = std::atan2 (spectrum[2 * k + 1], spectrum[2 * k]);
+        peak = juce::jmax (peak, mag[(size_t) k]);
+    }
+
+    if (peak <= 1.0e-9f)
+        return;
+
+    // Frequency-domain softening: gently leak energy to neighbouring bins, with
+    // stronger effect when the magnitude filter is high and isolated bins dominate.
+    for (int k = 0; k < numBins; ++k)
+    {
+        const float farLeft  = mag[(size_t) juce::jmax (0, k - 2)];
+        const float left     = mag[(size_t) juce::jmax (0, k - 1)];
+        const float mid      = mag[(size_t) k];
+        const float right    = mag[(size_t) juce::jmin (numBins - 1, k + 1)];
+        const float farRight = mag[(size_t) juce::jmin (numBins - 1, k + 2)];
+        shapedMag[(size_t) k] = (1.0f - smoothAmt) * mid
+                              + smoothAmt * (0.08f * farLeft + 0.22f * left + 0.40f * mid
+                                           + 0.22f * right + 0.08f * farRight);
+    }
+
+    const float residualLevel = organicAmt * organicAmt * (0.0007f + 0.0025f * filterAmt) * peak;
+    for (int k = 0; k < numBins; ++k)
+    {
+        const float localEnv = 0.5f * shapedMag[(size_t) k] / peak + 0.5f;
+        const float noiseMag = residualLevel * localEnv * (0.4f + 0.6f * st.phaseRng.nextFloat());
+        const float noisePhase = st.phaseRng.nextFloat() * juce::MathConstants<float>::twoPi;
+
+        const float re = shapedMag[(size_t) k] * std::cos (phase[(size_t) k])
+                       + noiseMag * std::cos (noisePhase);
+        const float im = shapedMag[(size_t) k] * std::sin (phase[(size_t) k])
+                       + noiseMag * std::sin (noisePhase);
+
+        spectrum[2 * k]     = re;
+        spectrum[2 * k + 1] = im;
+    }
+}
+
+void SpectralFreezeProcessor::applyOrganicSaturation (float* samples, float organicAmt) noexcept
+{
+    if (organicAmt <= 0.0f)
+        return;
+
+    const float drive = 1.0f + organicAmt * 4.0f;
+    const float makeup = 1.0f / std::tanh (drive);
+    const float wet = organicAmt * 0.60f;
+
+    for (int i = 0; i < fftSize; ++i)
+    {
+        const float dry = samples[(size_t) i];
+        const float sat = std::tanh (dry * drive) * makeup;
+        samples[(size_t) i] = dry + wet * (sat - dry);
     }
 }
 

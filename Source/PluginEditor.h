@@ -23,6 +23,7 @@ private:
     juce::WebToggleButtonRelay freezeRelay    { "freeze" };
     juce::WebSliderRelay       scBoostRelay      { "scBoost" };
     juce::WebSliderRelay       scFreqSmoothRelay { "scFreqSmoothing" };
+    juce::WebSliderRelay       organicRelay      { "organic" };
 
     juce::WebSliderParameterAttachment filterAttachment {
         *processorRef.apvts.getParameter (SpectralFreezeProcessor::filterParamID),
@@ -36,6 +37,9 @@ private:
     juce::WebSliderParameterAttachment scFreqSmoothAttachment {
         *processorRef.apvts.getParameter (SpectralFreezeProcessor::scFreqSmoothParamID),
         scFreqSmoothRelay };
+    juce::WebSliderParameterAttachment organicAttachment {
+        *processorRef.apvts.getParameter (SpectralFreezeProcessor::organicParamID),
+        organicRelay };
 
     juce::WebBrowserComponent webView { buildOptions() };
 

@@ -41,6 +41,7 @@ public:
     static constexpr const char* filterParamID   = "filter";
     static constexpr const char* scBoostParamID      = "scBoost";
     static constexpr const char* scFreqSmoothParamID = "scFreqSmoothing";
+    static constexpr const char* organicParamID      = "organic";
 
     // STFT config — 2048 @ 75% overlap. fftSize/hopSize = 4 → four overlapping windows per output sample.
     static constexpr int fftOrder = 11;
@@ -56,6 +57,10 @@ public:
     // measured phase-vocoder bin advances; this only prevents perfectly static locking.
     static constexpr float freezePhaseJitterRadians = 0.004f;
 
+    // Organic AM uses a small number of broad frequency bands so the motion feels
+    // like a coupled resonant body, not thousands of unrelated tremolos.
+    static constexpr int organicAmBands = 12;
+
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
@@ -63,6 +68,7 @@ private:
     std::atomic<float>* filterParam   { nullptr };
     std::atomic<float>* scBoostParam      { nullptr };
     std::atomic<float>* scFreqSmoothParam { nullptr };
+    std::atomic<float>* organicParam      { nullptr };
 
     // Per-bin natural phase advance across one hop: 2π·k·hopSize/fftSize.
     // Frozen bins use this coherent phase motion plus a tiny random walk.
@@ -95,6 +101,10 @@ private:
         int magHistoryCount = 0; // clamped to magHistorySize once full
 
         juce::Random phaseRng; // per-channel so stereo noise is decorrelated
+
+        std::array<float, organicAmBands> organicAmValue  {};
+        std::array<float, organicAmBands> organicAmTarget {};
+        int organicAmHopCounter = 0;
 
         int  fifoPos     = 0; // next write slot; also "oldest" slot from reader's POV
         int  samplesSeen = 0; // avoids freezing cold FIFO contents after host bus resets
@@ -131,7 +141,9 @@ private:
     void processFrame (ChannelState& st, bool applySidechain);
     void processSidechainHop (SidechainState& sc) noexcept;
     void applySpectralFilter (float* spectrum, float filterAmt) noexcept;
+    void applyOrganicSpectralProcessing (ChannelState& st, float* spectrum, float organicAmt, float filterAmt) noexcept;
     void applySidechainEnhancement (float* spectrum, float boostDb, float freqSmoothing) noexcept;
+    void applyOrganicSaturation (float* samples, float organicAmt) noexcept;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SpectralFreezeProcessor)
 };
