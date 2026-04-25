@@ -60,6 +60,12 @@ target_compile_definitions(SpectralFreeze PUBLIC
     JUCE_WEB_BROWSER=1
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
+    # On Windows, this is what actually unlocks WebBrowserComponent::Options::
+    # withResourceProvider — defining it makes juce_gui_extra.h derive
+    # JUCE_USE_WIN_WEBVIEW2=1, which is what the API-availability gate checks.
+    # NEEDS_WEBVIEW2 TRUE on juce_add_plugin only handles the SDK find/link
+    # side; this macro handles the header side. No-op on macOS.
+    JUCE_USE_WIN_WEBVIEW2_WITH_STATIC_LINKING=1
     SPECTRAL_FREEZE_UI_DEV=$<IF:$<BOOL:${SPECTRAL_FREEZE_UI_DEV}>,1,0>
     SPECTRAL_FREEZE_UI_DEV_URL="http://localhost:5173/"
 )
