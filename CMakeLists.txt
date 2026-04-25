@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.22)
 # (e.g. macOS 26) and the app refuses to launch on older systems with -10825.
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "")
 
-project(SpectralFreeze VERSION 0.1.0)
+project(SpectralFreeze VERSION 0.2.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -58,7 +58,6 @@ target_compile_definitions(SpectralFreeze PUBLIC
     JUCE_VST3_CAN_REPLACE_VST2=0
     SPECTRAL_FREEZE_UI_DEV=$<IF:$<BOOL:${SPECTRAL_FREEZE_UI_DEV}>,1,0>
     SPECTRAL_FREEZE_UI_DEV_URL="http://localhost:5173/"
-    SPECTRAL_FREEZE_UI_DIST_DIR="${CMAKE_SOURCE_DIR}/ui/dist"
 )
 
 target_link_libraries(SpectralFreeze
@@ -71,3 +70,40 @@ target_link_libraries(SpectralFreeze
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags
 )
+
+# Production builds (SPECTRAL_FREEZE_UI_DEV=OFF) embed the Vite bundle into the
+# plugin binary via juce_add_binary_data so the VST3 is self-contained. Dev
+# builds skip this and load the UI from the Vite dev server instead.
+if (NOT SPECTRAL_FREEZE_UI_DEV)
+    set(UI_DIR "${CMAKE_SOURCE_DIR}/ui")
+
+    # The UI's package.json declares juce-framework-frontend as
+    # `file:../build/_deps/juce-src/...`, which only exists after the JUCE
+    # FetchContent above has populated it — so we must run bun install AFTER
+    # FetchContent_MakeAvailable, not before.
+    message(STATUS "Building Spectral Freeze UI for embedded resources")
+
+    execute_process(
+        COMMAND bun install --frozen-lockfile
+        WORKING_DIRECTORY "${UI_DIR}"
+        RESULT_VARIABLE _ui_install_rc)
+    if (NOT _ui_install_rc EQUAL 0)
+        message(FATAL_ERROR "ui/: bun install failed (exit ${_ui_install_rc})")
+    endif()
+
+    execute_process(
+        COMMAND bun run build
+        WORKING_DIRECTORY "${UI_DIR}"
+        RESULT_VARIABLE _ui_build_rc)
+    if (NOT _ui_build_rc EQUAL 0)
+        message(FATAL_ERROR "ui/: bun run build failed (exit ${_ui_build_rc})")
+    endif()
+
+    file(GLOB_RECURSE UI_DIST_FILES CONFIGURE_DEPENDS "${UI_DIR}/dist/*")
+    if (UI_DIST_FILES STREQUAL "")
+        message(FATAL_ERROR "ui/dist is empty after vite build")
+    endif()
+
+    juce_add_binary_data(SpectralFreezeUIData SOURCES ${UI_DIST_FILES})
+    target_link_libraries(SpectralFreeze PRIVATE SpectralFreezeUIData)
+endif()

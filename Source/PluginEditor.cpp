@@ -1,5 +1,10 @@
 #include "PluginEditor.h"
 
+#if ! SPECTRAL_FREEZE_UI_DEV
+ #include "BinaryData.h"
+#endif
+
+#if ! SPECTRAL_FREEZE_UI_DEV
 namespace
 {
     juce::String mimeTypeForExtension (const juce::String& ext)
@@ -29,6 +34,7 @@ namespace
         return it != map.end() ? it->second : juce::String ("application/octet-stream");
     }
 }
+#endif
 
 SpectralFreezeEditor::SpectralFreezeEditor (SpectralFreezeProcessor& p)
     : AudioProcessorEditor (&p), processorRef (p)
@@ -78,27 +84,43 @@ juce::WebBrowserComponent::Options SpectralFreezeEditor::buildOptions()
 std::optional<juce::WebBrowserComponent::Resource>
 SpectralFreezeEditor::provideResource (const juce::String& urlPath)
 {
+   #if SPECTRAL_FREEZE_UI_DEV
+    juce::ignoreUnused (urlPath);
+    return std::nullopt;
+   #else
     // urlPath arrives like "/" or "/assets/main-abcd.js" — strip the leading slash
-    // and map "/" → "index.html" (standard static-site behaviour).
+    // and map "/" → "index.html" (standard static-site behaviour). juce_add_binary_data
+    // flattens directory structure, so we match by basename against the original
+    // filename stored alongside each embedded resource.
     auto relative = urlPath.startsWith ("/") ? urlPath.substring (1) : urlPath;
     if (relative.isEmpty())
         relative = "index.html";
 
-    const juce::File distRoot { SPECTRAL_FREEZE_UI_DIST_DIR };
-    const juce::File file = distRoot.getChildFile (relative);
+    const auto basename = relative.fromLastOccurrenceOf ("/", false, false);
 
-    if (! file.existsAsFile())
-        return std::nullopt;
+    for (int i = 0; i < BinaryData::namedResourceListSize; ++i)
+    {
+        const auto* resourceName   = BinaryData::namedResourceList[i];
+        const auto* originalName   = BinaryData::getNamedResourceOriginalFilename (resourceName);
 
-    juce::MemoryBlock bytes;
-    if (! file.loadFileAsData (bytes))
-        return std::nullopt;
+        if (originalName == nullptr || basename != juce::String (originalName))
+            continue;
 
-    std::vector<std::byte> data (bytes.getSize());
-    std::memcpy (data.data(), bytes.getData(), bytes.getSize());
+        int dataSize = 0;
+        const auto* data = BinaryData::getNamedResource (resourceName, dataSize);
+        if (data == nullptr || dataSize <= 0)
+            return std::nullopt;
 
-    return juce::WebBrowserComponent::Resource {
-        std::move (data),
-        mimeTypeForExtension (file.getFileExtension().trimCharactersAtStart ("."))
-    };
+        std::vector<std::byte> bytes (static_cast<size_t> (dataSize));
+        std::memcpy (bytes.data(), data, static_cast<size_t> (dataSize));
+
+        const auto ext = juce::String (originalName).fromLastOccurrenceOf (".", false, false);
+        return juce::WebBrowserComponent::Resource {
+            std::move (bytes),
+            mimeTypeForExtension (ext)
+        };
+    }
+
+    return std::nullopt;
+   #endif
 }
