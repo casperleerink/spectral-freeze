@@ -38,8 +38,17 @@ jobs:
         with:
           bun-version: 1.3.10
 
+      # WebView2 SDK provides the static loader lib that NEEDS_WEBVIEW2 TRUE in
+      # juce_add_plugin links against. JUCE's FindWebView2.cmake searches the
+      # path given via JUCE_WEBVIEW2_PACKAGE_LOCATION for a *Microsoft.Web.WebView2*
+      # directory. nuget.exe is preinstalled on windows-latest runners.
+      - name: Install WebView2 SDK (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: nuget install Microsoft.Web.WebView2 -Version 1.0.3485.44 -OutputDirectory "$env:GITHUB_WORKSPACE\.nuget"
+
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DSPECTRAL_FREEZE_UI_DEV=OFF
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DSPECTRAL_FREEZE_UI_DEV=OFF -DJUCE_WEBVIEW2_PACKAGE_LOCATION="${{ github.workspace }}/.nuget"
 
       - name: Build
         run: cmake --build build --config Release --parallel

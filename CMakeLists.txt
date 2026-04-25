@@ -31,6 +31,10 @@ juce_add_plugin(SpectralFreeze
     NEEDS_MIDI_OUTPUT       FALSE
     IS_MIDI_EFFECT          FALSE
     COPY_PLUGIN_AFTER_BUILD TRUE
+    # Required on Windows so WebBrowserComponent::Options::withResourceProvider
+    # is available — without it JUCE_WEB_BROWSER_RESOURCE_PROVIDER_AVAILABLE is
+    # 0 on Windows and the Options API silently omits the method. No-op on macOS.
+    NEEDS_WEBVIEW2          TRUE
     PLUGIN_MANUFACTURER_CODE Lrng
     PLUGIN_CODE             Spfr
     FORMATS                 AU VST3 Standalone
