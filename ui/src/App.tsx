@@ -17,11 +17,23 @@ const App: Component = () => {
       <main class="flex-1 flex items-center justify-center">
         <div class="flex flex-col gap-8 items-center">
           <FreezeButton paramId="freeze" />
-          <Knob
-            paramId="filter"
-            label="Filter"
-            format={(v) => `${Math.round(v * 100)}%`}
-          />
+          <div class="flex flex-wrap justify-center gap-6 max-w-[680px]">
+            <Knob
+              paramId="filter"
+              label="Filter"
+              format={(v) => `${Math.round(v * 100)}%`}
+            />
+            <Knob
+              paramId="scBoost"
+              label="SC Boost"
+              format={(v) => `+${v.toFixed(1)} dB`}
+            />
+            <Knob
+              paramId="scFreqSmoothing"
+              label="SC Smooth"
+              format={(v) => `${Math.round(v * 100)}%`}
+            />
+          </div>
         </div>
       </main>
     </div>

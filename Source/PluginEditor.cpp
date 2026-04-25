@@ -62,9 +62,8 @@ juce::WebBrowserComponent::Options SpectralFreezeEditor::buildOptions()
         .withNativeIntegrationEnabled()
         .withOptionsFrom (filterRelay)
         .withOptionsFrom (freezeRelay)
-        .withOptionsFrom (scMixRelay)
-        .withOptionsFrom (scSelectRelay)
-        .withOptionsFrom (scSmoothRelay);
+        .withOptionsFrom (scBoostRelay)
+        .withOptionsFrom (scFreqSmoothRelay);
 
    #if ! SPECTRAL_FREEZE_UI_DEV
     options = options.withResourceProvider (

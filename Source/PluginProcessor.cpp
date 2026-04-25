@@ -10,11 +10,10 @@ SpectralFreezeProcessor::SpectralFreezeProcessor()
 {
     freezeParam   = apvts.getRawParameterValue (freezeParamID);
     filterParam   = apvts.getRawParameterValue (filterParamID);
-    scMixParam    = apvts.getRawParameterValue (scMixParamID);
-    scSelectParam = apvts.getRawParameterValue (scSelectParamID);
-    scSmoothParam = apvts.getRawParameterValue (scSmoothParamID);
+    scBoostParam      = apvts.getRawParameterValue (scBoostParamID);
+    scFreqSmoothParam = apvts.getRawParameterValue (scFreqSmoothParamID);
     jassert (freezeParam != nullptr && filterParam != nullptr
-             && scMixParam != nullptr && scSelectParam != nullptr && scSmoothParam != nullptr);
+             && scBoostParam != nullptr && scFreqSmoothParam != nullptr);
 }
 
 SpectralFreezeProcessor::~SpectralFreezeProcessor() = default;
@@ -36,29 +35,20 @@ SpectralFreezeProcessor::createParameterLayout()
         juce::NormalisableRange<float> { 0.0f, 1.0f, 0.001f },
         0.0f));
 
-    // Sidechain mask controls.
-    // Mix        — dry↔wet blend between "pass main untouched" and "gate main by SC spectrum".
-    // Selectivity — gamma on the normalised SC spectrum: 0 = gentle sympathetic ring,
-    //               1 = strict "only the loudest SC bins pass."
-    // Smoothing  — per-bin one-pole follower on the SC magnitude: tames the chirpy
-    //               frame-to-frame jitter you get from raw FFT magnitudes.
+    // Sidechain enhancement controls. The sidechain path is intentionally simple:
+    // Boost sets the maximum matched-bin lift; Freq Smooth widens/softens the boost
+    // mask across neighbouring FFT bins. Other shaping uses fixed musical defaults.
     layout.add (std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID { scMixParamID, 1 },
-        "SC Mix",
-        juce::NormalisableRange<float> { 0.0f, 1.0f, 0.001f },
-        0.0f));
+        juce::ParameterID { scBoostParamID, 1 },
+        "SC Boost",
+        juce::NormalisableRange<float> { 0.0f, 18.0f, 0.01f },
+        9.0f));
 
     layout.add (std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID { scSelectParamID, 1 },
-        "SC Selectivity",
+        juce::ParameterID { scFreqSmoothParamID, 1 },
+        "SC Freq Smooth",
         juce::NormalisableRange<float> { 0.0f, 1.0f, 0.001f },
-        0.5f));
-
-    layout.add (std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID { scSmoothParamID, 1 },
-        "SC Smoothing",
-        juce::NormalisableRange<float> { 0.0f, 1.0f, 0.001f },
-        0.3f));
+        0.25f));
 
     return layout;
 }
@@ -147,13 +137,12 @@ void SpectralFreezeProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
         scChNum = juce::jmin (scBuf.getNumChannels(), (int) scChannels.size());
     }
 
-    const float scMix       = juce::jlimit (0.0f, 1.0f, scMixParam->load());
-    const float scSmoothAmt = juce::jlimit (0.0f, 1.0f, scSmoothParam->load());
-    const bool  runSidechain = scBusLive && scChNum > 0 && scMix > 0.0f;
+    const float scBoostDb = juce::jlimit (0.0f, 18.0f, scBoostParam->load());
+    const bool  runSidechain = scBusLive && scChNum > 0 && scBoostDb > 0.0f;
 
-    // Map smoothing knob onto a one-pole retention coefficient in [0, 0.98].
-    // 0.98 ≈ ~200 ms time-constant at hopSize/44.1kHz — gentle "sympathetic ring."
-    const float scRetention = scSmoothAmt * 0.98f;
+    // Fixed, gentle time smoothing for the sidechain spectrum. The user-facing
+    // smoothing control is reserved for frequency width/blur, not envelope timing.
+    const float scRetention = 0.65f;
 
     // Sample-level outer loop so MAIN + SIDECHAIN hit their hop boundary in
     // perfect lockstep. Within a hop we pull the SC magnitude spectrum first,
@@ -293,9 +282,9 @@ void SpectralFreezeProcessor::processFrame (ChannelState& st, bool applySidechai
     // Runs AFTER freeze resynthesis so a frozen cloud can be sculpted by a live sidechain.
     if (applySidechain)
     {
-        const float scMix = juce::jlimit (0.0f, 1.0f, scMixParam->load());
-        const float scSel = juce::jlimit (0.0f, 1.0f, scSelectParam->load());
-        applySidechainMask (st.fftScratch.data(), scMix, scSel);
+        const float scBoostDb    = juce::jlimit (0.0f, 18.0f, scBoostParam->load());
+        const float scFreqSmooth = juce::jlimit (0.0f, 1.0f, scFreqSmoothParam->load());
+        applySidechainEnhancement (st.fftScratch.data(), scBoostDb, scFreqSmooth);
     }
 
     // --- Rebuild conjugate mirror so the inverse FFT returns a purely real signal --------
@@ -378,44 +367,82 @@ void SpectralFreezeProcessor::processSidechainHop (SidechainState& sc) noexcept
     }
 }
 
-void SpectralFreezeProcessor::applySidechainMask (float* spectrum, float mix, float selectivity) noexcept
+void SpectralFreezeProcessor::applySidechainEnhancement (float* spectrum, float boostDb,
+                                                          float freqSmoothing) noexcept
 {
-    if (mix <= 0.0f)
+    if (boostDb <= 0.0f)
         return;
 
-    // Peak of the smoothed SC spectrum — used to normalise into [0, 1]. Normalising
-    // means "SC loudness" doesn't swing the mask wildly; only the SHAPE matters.
-    float peak = 0.0f;
-    for (int k = 0; k < numBins; ++k)
-        if (scSmoothedMag[(size_t) k] > peak)
-            peak = scSmoothedMag[(size_t) k];
-
-    if (peak <= 1.0e-9f)
+    auto smoothstep = [] (float x) noexcept
     {
-        // SC is effectively silent: at mix=1 the main signal should duck to zero;
-        // at mix<1 it passes through proportionally. Matches how "held-notes-only"
-        // feels — when nothing is held, nothing rings.
-        const float g = 1.0f - mix;
-        for (int k = 0; k < numBins; ++k)
-        {
-            spectrum[2 * k]     *= g;
-            spectrum[2 * k + 1] *= g;
-        }
-        return;
+        x = juce::jlimit (0.0f, 1.0f, x);
+        return x * x * (3.0f - 2.0f * x);
+    };
+
+    float scPeak = 0.0f;
+    float mainPeak = 0.0f;
+    for (int k = 0; k < numBins; ++k)
+    {
+        scPeak = juce::jmax (scPeak, scSmoothedMag[(size_t) k]);
+
+        const float re = spectrum[2 * k];
+        const float im = spectrum[2 * k + 1];
+        mainPeak = juce::jmax (mainPeak, std::sqrt (re * re + im * im));
     }
 
-    // Map selectivity [0, 1] → gamma [0.5, 8]. Low gamma = broad "halo" around every
-    // SC partial; high gamma = strict "only the tallest peaks survive."
-    const float gamma   = 0.5f + selectivity * 7.5f;
-    const float invPeak = 1.0f / peak;
+    // Silent sidechain or silent main: boost mode leaves the main signal unchanged.
+    if (scPeak <= 1.0e-9f || mainPeak <= 1.0e-9f)
+        return;
+
+    // Build a boost mask from BOTH spectra. The sidechain says which frequencies
+    // should be emphasised; mainPresence prevents boosting bins that are only FFT
+    // leakage/noise in the main signal.
+    std::array<float, numBins> rawMask {};
+    std::array<float, numBins> mask {};
+
+    // Fixed broad-ish selectivity. User-facing focus is boost amount + smoothing.
+    constexpr float gamma = 1.25f;
+    const float invScPeak = 1.0f / scPeak;
+    const float invMainPeak = 1.0f / mainPeak;
 
     for (int k = 0; k < numBins; ++k)
     {
-        const float norm = scSmoothedMag[(size_t) k] * invPeak;  // [0, 1]
-        const float mask = std::pow (norm, gamma);                // shaped selectivity
-        const float g    = (1.0f - mix) + mix * mask;             // mix blends mask↔unity
-        spectrum[2 * k]     *= g;
-        spectrum[2 * k + 1] *= g;
+        const float re = spectrum[2 * k];
+        const float im = spectrum[2 * k + 1];
+        const float mainNorm = std::sqrt (re * re + im * im) * invMainPeak;
+        const float scNorm = scSmoothedMag[(size_t) k] * invScPeak;
+
+        const float scMatch = std::pow (juce::jlimit (0.0f, 1.0f, scNorm), gamma);
+
+        // Main presence is an eligibility curve, not a second heavy gain shape:
+        // below about -48 dB relative to the frame peak, don't boost; by about
+        // -26 dB, allow the sidechain match through fully.
+        constexpr float presenceThreshold = 0.004f;
+        constexpr float presenceFull = 0.05f;
+        const float mainPresence = smoothstep ((mainNorm - presenceThreshold)
+                                             / (presenceFull - presenceThreshold));
+        rawMask[(size_t) k] = scMatch * mainPresence;
+    }
+
+    // Optional one-bin frequency smoothing. This blends each bin with its neighbours
+    // to reduce isolated, chirpy boosts while preserving the original mask at 0%.
+    const float a = juce::jlimit (0.0f, 1.0f, freqSmoothing);
+    for (int k = 0; k < numBins; ++k)
+    {
+        const float left  = rawMask[(size_t) juce::jmax (0, k - 1)];
+        const float mid   = rawMask[(size_t) k];
+        const float right = rawMask[(size_t) juce::jmin (numBins - 1, k + 1)];
+        mask[(size_t) k] = (1.0f - a) * mid + a * (0.25f * left + 0.5f * mid + 0.25f * right);
+    }
+
+    const float maxBoost = juce::Decibels::decibelsToGain (juce::jlimit (0.0f, 18.0f, boostDb));
+    for (int k = 0; k < numBins; ++k)
+    {
+        const float shaped = smoothstep (mask[(size_t) k]);
+        const float boostGain = 1.0f + (maxBoost - 1.0f) * shaped;
+
+        spectrum[2 * k]     *= boostGain;
+        spectrum[2 * k + 1] *= boostGain;
     }
 }
 

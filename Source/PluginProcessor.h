@@ -39,9 +39,8 @@ public:
 
     static constexpr const char* freezeParamID   = "freeze";
     static constexpr const char* filterParamID   = "filter";
-    static constexpr const char* scMixParamID    = "scMix";
-    static constexpr const char* scSelectParamID = "scSelectivity";
-    static constexpr const char* scSmoothParamID = "scSmoothing";
+    static constexpr const char* scBoostParamID      = "scBoost";
+    static constexpr const char* scFreqSmoothParamID = "scFreqSmoothing";
 
     // STFT config — 2048 @ 75% overlap. fftSize/hopSize = 4 → four overlapping windows per output sample.
     static constexpr int fftOrder = 11;
@@ -58,9 +57,8 @@ private:
 
     std::atomic<float>* freezeParam   { nullptr };
     std::atomic<float>* filterParam   { nullptr };
-    std::atomic<float>* scMixParam    { nullptr };
-    std::atomic<float>* scSelectParam { nullptr };
-    std::atomic<float>* scSmoothParam { nullptr };
+    std::atomic<float>* scBoostParam      { nullptr };
+    std::atomic<float>* scFreqSmoothParam { nullptr };
 
     struct ChannelState
     {
@@ -113,7 +111,7 @@ private:
     void processFrame (ChannelState& st, bool applySidechain);
     void processSidechainHop (SidechainState& sc) noexcept;
     void applySpectralFilter (float* spectrum, float filterAmt) noexcept;
-    void applySidechainMask (float* spectrum, float mix, float selectivity) noexcept;
+    void applySidechainEnhancement (float* spectrum, float boostDb, float freqSmoothing) noexcept;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SpectralFreezeProcessor)
 };

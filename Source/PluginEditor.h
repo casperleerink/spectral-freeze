@@ -21,9 +21,8 @@ private:
     // the webview and attachments die first — safely.
     juce::WebSliderRelay       filterRelay    { "filter" };
     juce::WebToggleButtonRelay freezeRelay    { "freeze" };
-    juce::WebSliderRelay       scMixRelay     { "scMix" };
-    juce::WebSliderRelay       scSelectRelay  { "scSelectivity" };
-    juce::WebSliderRelay       scSmoothRelay  { "scSmoothing" };
+    juce::WebSliderRelay       scBoostRelay      { "scBoost" };
+    juce::WebSliderRelay       scFreqSmoothRelay { "scFreqSmoothing" };
 
     juce::WebSliderParameterAttachment filterAttachment {
         *processorRef.apvts.getParameter (SpectralFreezeProcessor::filterParamID),
@@ -31,15 +30,12 @@ private:
     juce::WebToggleButtonParameterAttachment freezeAttachment {
         *processorRef.apvts.getParameter (SpectralFreezeProcessor::freezeParamID),
         freezeRelay };
-    juce::WebSliderParameterAttachment scMixAttachment {
-        *processorRef.apvts.getParameter (SpectralFreezeProcessor::scMixParamID),
-        scMixRelay };
-    juce::WebSliderParameterAttachment scSelectAttachment {
-        *processorRef.apvts.getParameter (SpectralFreezeProcessor::scSelectParamID),
-        scSelectRelay };
-    juce::WebSliderParameterAttachment scSmoothAttachment {
-        *processorRef.apvts.getParameter (SpectralFreezeProcessor::scSmoothParamID),
-        scSmoothRelay };
+    juce::WebSliderParameterAttachment scBoostAttachment {
+        *processorRef.apvts.getParameter (SpectralFreezeProcessor::scBoostParamID),
+        scBoostRelay };
+    juce::WebSliderParameterAttachment scFreqSmoothAttachment {
+        *processorRef.apvts.getParameter (SpectralFreezeProcessor::scFreqSmoothParamID),
+        scFreqSmoothRelay };
 
     juce::WebBrowserComponent webView { buildOptions() };
 
