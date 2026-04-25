@@ -75,10 +75,14 @@ void SpectralFreezeProcessor::prepareToPlay (double /*sampleRate*/, int /*sample
     channels  .assign ((size_t) getChannelCountOfBus (true, 0), ChannelState{});
     scChannels.assign ((size_t) getChannelCountOfBus (true, 1), SidechainState{});
 
-    // Seed each channel's phase RNG independently so L/R freeze noise is
-    // decorrelated — otherwise the stereo image collapses to a centre point.
+    // Seed each channel's tiny freeze phase wander independently so L/R do not
+    // collapse into exactly the same frozen texture.
     for (auto& ch : channels)
         ch.phaseRng.setSeedRandomly();
+
+    for (int k = 0; k < numBins; ++k)
+        phaseAdvance[(size_t) k] = juce::MathConstants<float>::twoPi
+                                 * (float) k * (float) hopSize / (float) fftSize;
 
     scLatestMag.fill (0.0f);
     scSmoothedMag.fill (0.0f);
@@ -225,15 +229,39 @@ void SpectralFreezeProcessor::processFrame (ChannelState& st, bool applySidechai
 
         fft.performRealOnlyForwardTransform (st.fftScratch.data());
 
-        // Push this frame's magnitude spectrum into the rolling history so that
-        // capturing the freeze edge can average across several recent frames.
+        // Push this frame's magnitude spectrum into the rolling history, and track
+        // the actual phase movement of each bin. The latter is the important middle
+        // ground: deterministic bin-centre phase was choppy, fully random phase was
+        // reverb-like, measured phase advance follows the captured source motion.
         auto& slot = st.magHistory[(size_t) st.magHistoryWrite];
         for (int k = 0; k < numBins; ++k)
         {
             const float re = st.fftScratch[(size_t) (2 * k)];
             const float im = st.fftScratch[(size_t) (2 * k + 1)];
+            const float phase = std::atan2 (im, re);
             slot[(size_t) k] = std::sqrt (re * re + im * im);
+
+            if (st.hasLastAnalysisPhase)
+            {
+                float deviation = phase - st.lastAnalysisPhase[(size_t) k] - phaseAdvance[(size_t) k];
+                while (deviation > juce::MathConstants<float>::pi)
+                    deviation -= juce::MathConstants<float>::twoPi;
+                while (deviation < -juce::MathConstants<float>::pi)
+                    deviation += juce::MathConstants<float>::twoPi;
+
+                const float measuredAdvance = phaseAdvance[(size_t) k] + deviation;
+                st.smoothedPhaseAdvance[(size_t) k]
+                    = 0.65f * st.smoothedPhaseAdvance[(size_t) k]
+                    + 0.35f * measuredAdvance;
+            }
+            else
+            {
+                st.smoothedPhaseAdvance[(size_t) k] = phaseAdvance[(size_t) k];
+            }
+
+            st.lastAnalysisPhase[(size_t) k] = phase;
         }
+        st.hasLastAnalysisPhase = true;
         st.magHistoryWrite = (st.magHistoryWrite + 1) % magHistorySize;
         if (st.magHistoryCount < magHistorySize)
             ++st.magHistoryCount;
@@ -242,9 +270,9 @@ void SpectralFreezeProcessor::processFrame (ChannelState& st, bool applySidechai
     // --- Freeze memory --------------------------------------------------------------------
     if (captureEdge)
     {
-        // Average magnitudes across whatever history we have. This smears out
-        // transients and vibrato in the snapshot so you hear a "steady timbre"
-        // instead of one frozen 46 ms window.
+        // Average magnitudes across a short history so the freeze edge is smooth,
+        // but keep the actual edge phase and measured phase advance. Fully random
+        // phase was too diffuse/reverb-like; bin-centre coherent phase was choppy.
         const int   count    = juce::jmax (1, st.magHistoryCount);
         const float invCount = 1.0f / (float) count;
         for (int k = 0; k < numBins; ++k)
@@ -252,21 +280,33 @@ void SpectralFreezeProcessor::processFrame (ChannelState& st, bool applySidechai
             float sum = 0.0f;
             for (int h = 0; h < count; ++h)
                 sum += st.magHistory[(size_t) h][(size_t) k];
-            st.frozenMag[(size_t) k] = sum * invCount;
+
+            const float re = st.fftScratch[(size_t) (2 * k)];
+            const float im = st.fftScratch[(size_t) (2 * k + 1)];
+            st.frozenMag         [(size_t) k] = sum * invCount;
+            st.frozenPhase       [(size_t) k] = std::atan2 (im, re);
+            st.frozenPhaseAdvance[(size_t) k] = st.smoothedPhaseAdvance[(size_t) k];
         }
     }
 
     // --- Spectral processing --------------------------------------------------------------
     if (freezeOn)
     {
-        // Draw a fresh phase per bin per hop. With 75%-overlap OLA the four
-        // overlapping synthesis frames sum incoherently, which turns a frozen
-        // tone into a smooth stochastic sustain — no hop-rate beating, no
-        // "single window repeating" signature.
+        // Advance captured phase by the live signal's measured per-bin motion, with
+        // only a tiny random walk. This avoids both extremes: no fresh random phase
+        // cloud, and no rigid bin-centre loop that chops/beats at the hop rate.
         for (int k = 0; k < numBins; ++k)
         {
-            const float phase = st.phaseRng.nextFloat() * juce::MathConstants<float>::twoPi
-                              - juce::MathConstants<float>::pi;
+            float phase = st.frozenPhase[(size_t) k]
+                        + st.frozenPhaseAdvance[(size_t) k]
+                        + (st.phaseRng.nextFloat() * 2.0f - 1.0f) * freezePhaseJitterRadians;
+
+            if (phase > juce::MathConstants<float>::pi)
+                phase -= juce::MathConstants<float>::twoPi;
+            else if (phase < -juce::MathConstants<float>::pi)
+                phase += juce::MathConstants<float>::twoPi;
+
+            st.frozenPhase[(size_t) k] = phase;
             const float mag = st.frozenMag[(size_t) k];
             st.fftScratch[(size_t) (2 * k)]     = mag * std::cos (phase);
             st.fftScratch[(size_t) (2 * k + 1)] = mag * std::sin (phase);

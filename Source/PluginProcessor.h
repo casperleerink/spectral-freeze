@@ -48,9 +48,13 @@ public:
     static constexpr int hopSize  = fftSize / 4;
     static constexpr int numBins  = fftSize / 2 + 1; // DC..Nyquist (non-negative frequencies)
 
-    // Freeze captures an averaged magnitude spectrum over the last N analysis hops
-    // (≈ 93 ms @ 44.1k), which smears out transients and vibrato in the snapshot.
-    static constexpr int magHistorySize = 8;
+    // Freeze captures a short averaged magnitude spectrum over the last N analysis hops
+    // (≈ 46 ms @ 44.1k). This softens the freeze edge without washing the sound into a cloud.
+    static constexpr int magHistorySize = 4;
+
+    // Very small per-hop phase wander for frozen bins. The main smoothness now comes from
+    // measured phase-vocoder bin advances; this only prevents perfectly static locking.
+    static constexpr float freezePhaseJitterRadians = 0.004f;
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
@@ -60,16 +64,29 @@ private:
     std::atomic<float>* scBoostParam      { nullptr };
     std::atomic<float>* scFreqSmoothParam { nullptr };
 
+    // Per-bin natural phase advance across one hop: 2π·k·hopSize/fftSize.
+    // Frozen bins use this coherent phase motion plus a tiny random walk.
+    std::array<float, numBins> phaseAdvance {};
+
     struct ChannelState
     {
         std::array<float, fftSize>     inputFifo {};
         std::array<float, fftSize>     outputFifo {};
         std::array<float, fftSize * 2> fftScratch {}; // juce real-FFT needs 2N floats
 
-        // Frozen magnitude spectrum — averaged over the last magHistorySize hops
-        // at the freeze edge. Phase is redrawn at random every hop during freeze
-        // (no accumulator needed), which kills hop-rate beating.
-        std::array<float, numBins> frozenMag {};
+        // Frozen spectrum memory. Magnitude is averaged over a short history at the
+        // freeze edge; phase is captured from the edge frame and advanced with the
+        // measured per-bin phase motion from the live signal.
+        std::array<float, numBins> frozenMag          {};
+        std::array<float, numBins> frozenPhase        {};
+        std::array<float, numBins> frozenPhaseAdvance {};
+
+        // Live phase-vocoder tracking. Bin-centre phase advance is what made the old
+        // freeze beat/chop when a partial sat between FFT bins; these measured advances
+        // preserve that off-bin motion instead of forcing everything onto bin centres.
+        std::array<float, numBins> lastAnalysisPhase       {};
+        std::array<float, numBins> smoothedPhaseAdvance    {};
+        bool hasLastAnalysisPhase = false;
 
         // Rolling history of recent analysis-frame magnitudes. Written on every
         // non-frozen hop; averaged on the freeze edge to form `frozenMag`.
